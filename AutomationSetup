@@ -1,0 +1,191 @@
+# CreatedBy: Brayden Horlacher
+
+<# VERSION 1.0
+Creates the resource group, Automation Account, Managed Identity, Assigns the Managed Identity the required roles,
+Creates a Source control to GitHub to allow for automating the creation of Runbooks, creates webhooks for the runbooks,
+creates a keyvault and assists with uploading the Webhook secrets to the Keyvault.
+#>
+
+# Disconnects from any existing AzAccounts logged in
+#Disconnect-AzAccount
+
+# Connects to the desired AzAccount - Use a Global Admin account for this
+#Connect-AzAccount
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Define the variables for the script
+    # $AccessToken:     Converts the GitHub access token to a secure string, it will fail to authenticate otherwise
+    # $SubscriptionID:  Get's the subscription ID from the Connect-AzAccount context of the user
+
+    $resourceGroupName      = "Automation-Test"
+    $AutomationAccountName  = "Automation-Test-SAGA"
+    $location               = "Australia East"
+    $tags                   = @{"CreatedBy"="Lancom"; "Environment"="PROD"; "System"="Automation"}
+    $AccessToken            = ConvertTo-SecureString -String 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 -AsPlainText
+    $SubscriptionID         = (Get-AzContext).Subscription.Id
+    $KeyVaultName           = "SAGA-Automation-KeyVault"
+
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Create a resource group with our desired name, if it doesn't exist
+
+    if (-not (Get-AzResourceGroup -Name $resourceGroupName -ErrorAction SilentlyContinue)) {
+        Write-Host "Creating resource group '$resourceGroupName' in location '$location'..."
+        New-AzResourceGroup -Name $resourceGroupName -Location $location -Tag $tags 
+    } else {
+        Write-Host "Resource group '$resourceGroupName' already exists."
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Create the Automation Account in the resource group
+
+    Write-Host "Creating Azure Automation Account '$AutomationAccountName' in resource group '$resourceGroupName'..."
+    New-AzAutomationAccount -ResourceGroupName $resourceGroupName `
+        -Name $AutomationAccountName `
+        -Location $location `
+        -AssignSystemIdentity `
+        -Tags $tags
+
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Create the System-Assigned Managed Identity
+$automationAccount = Get-AzAutomationAccount -ResourceGroupName $resourceGroupName
+
+    if ($automationAccount) {
+        Write-Host "Automation Account '$AutomationAccountName' created successfully with System-Assigned Managed Identity."
+        Write-Host "Managed Identity details:"
+        Write-Output $automationAccount.Identity
+    } else {
+        Write-Error "Failed to create Automation Account '$AutomationAccountName'."
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Verify that the Automation Account exists
+
+    if (-not (Get-AzAutomationAccount -ResourceGroupName $resourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue)) {
+        Write-Error "Automation Account '$AutomationAccountName' does not exist in resource group '$resourceGroupName'. Please create it first."
+        return
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Assigns the contributor role to the ManagedIdentity we created for the AutomationAccount
+    # $identity:    Gets the managed identity's object ID, so we can assign the Contributor role to it
+    # $role:        Get's the ID for the contributor role, we need this for the Github source control so we can create the runbooks using the sync option
+    # $scope:       Set's The scope for where the permissions should be assigned, I've assigned this at the subscription level 
+    # $Contributor: Get's the current role assignments of the Managed Identity, and checks if the object is already a contributor on the specified scope
+
+    $identity    = ($automationAccount.Identity).PrincipalId
+    $role        = (Get-AzRoleDefinition -Name "Contributor").Id
+    $scope       = "/subscriptions/$SubscriptionID"
+    $Contributor = Get-AzRoleAssignment -ObjectId $identity -RoleDefinitionId $role -Scope $scope
+    
+    # Checks if the Object (In this case the Managed Identity) is already a Contributor on the specificed scope
+    if ($Contributor.RoleDefinitionName -eq "Contributor") {
+        Write-Output "Selected Object is already a contributor, skipping..."
+    } else {
+        # Assigns the contributor role to the Managed Identity, we need this for the Github source control to be able to create the Runbooks
+        New-AzRoleAssignment -ObjectId $identity -RoleDefinitionId $role -Scope $scope
+    }
+
+
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Creates a source control from Github - Not sure if this is the way we want to do this, but there isn't any other "easy" way to import runbooks 
+    # Guide on how to create the AccessToken: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+    # When creating the runbook in GitHub, you need to create the file as "yourfilenmae.ps1" (e.g.: Test-Runbook.ps1)
+    
+ 
+    # Creates the Source Control link between Azure and Github
+    New-AzAutomationSourceControl -Name GitHub -RepoUrl https://github.com/BraydenHorlacher/Automation-Test.git -Branch main -SourceType GitHub -FolderPath "/" -AccessToken $AccessToken -ResourceGroupName "Automation-Test" -AutomationAccountName "$AutomationAccountName"
+
+    # Starts the created Source Control Sync Job - Auto syncing is not working at the moment is a known bug
+    Start-AzAutomationSourceControlSyncJob -Name GitHub -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName
+
+    # $SyncStatus:  Get's the status of the sync job between Azure and GitHub that imports the runbooks with pre-populated content
+    $SyncStatus = Get-AzAutomationSourceControlSyncJob -Name GitHub -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName
+
+    # if:       Checks if the status of the sync job is "Succeeded" or not, if it is not successful it will output a list showing the sync failed, it's creation date, Start Time, and End Time. It will then try to re-run the sync
+    # elseif:   Checks if the status of the sync job is "Succeeded", if it is it will output and show what runbooks where imported into Azure
+    if ($SyncStatus.ProvisioningState -ne "Succeeded") {
+        $SyncStatus | Format-List
+        Start-AzAutomationSourceControlSyncJob -Name GitHub -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName
+
+    } elseif ($SyncStatus.ProvisioningState -eq "Succeeded") {
+        Write-Output "Source Control Sync completed. Runbooks imported from Github are as follows: "
+        (Get-AzAutomationRunbook -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName).Name
+
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+$KeyVault       = Get-AzKeyVault -Name $KeyVaultName
+$KeyVaultrole   = (Get-AzRoleDefinition -Name "Key Vault Administrator").Id
+$KeyVaultscope  = "/"
+$KeyVaultAdmin  = Get-AzRoleAssignment -ObjectId $identity -RoleDefinitionId $KeyVaultrole -Scope $KeyVaultscope
+
+if($KeyVault -eq $false){ 
+    New-AzKeyVault -Name $KeyVaultName -ResourceGroupName $resourceGroupName -Location $location
+    Write-Output "Creating KeyVault: $KeyVaultName"
+} else {
+    Write-Output "KeyVault already exists, skipping..."
+}
+
+if ($KeyVaultAdmin.RoleDefinitionName -eq "Key Vault Administrator") {
+    Write-Output "Selected Object is already a Key Vault Admin, skipping..."
+} else {
+    # Assigns the Key Vault Administrator role to the Managed Identity, this would allow it to upload keys etc. - not sure that it needs this though
+    New-AzRoleAssignment -ObjectId $identity -RoleDefinitionId $KeyVaultrole -Scope $KeyVaultscope
+}
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+# Create the Webhooks for the Automation accounts
+    # $ExcludedRunbooks:    Excludes runbooks from the check in $Runbooks
+    # $Runbooks:            Does a check against what run books are already in the automation account and if they already have a Webhook assigned to them
+
+    $ExcludedRunbooks       = @("Test2","Test3")
+    $Runbooks               = (Get-AzAutomationRunbook -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName).Name
+    $FilteredRunbooks       = $Runbooks | Where-Object { -not ($ExcludedRunbooks -contains $_)}
+    $CurrentYear            = (Get-Date).Year
+    $SpecificDate           = Get-Date "01/01/$CurrentYear"
+    $ExpiryDate             = $SpecificDate.AddYears(10)
+
+    if ((Get-AzAutomationWebhook -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName).Name -ne $FilteredRunbooks) {
+        foreach($Runbook in $FilteredRunbooks){
+            New-AzAutomationWebhook -RunbookName $Runbook -Name $Runbook -ExpiryTime $ExpiryDate -ResourceGroupName $resourceGroupName -IsEnabled $True -AutomationAccountName $AutomationAccountName
+        }
+    } else {
+        Write-Output "The runbooks have already been created, or there was an error. Please check Azure"
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------------------
+    $webhooks = Get-AzAutomationWebhook -ResourceGroupName $resourceGroupName -AutomationAccountName $AutomationAccountName
+
+    if ($webhooks) {
+        foreach ($webhook in $webhooks) {
+            $webhookName    = $webhook.Name
+            $webhookprompt  = Read-Host -Prompt "Please copy and paste the Webhook URI for $WebhookName here: (This will upload it into the AzureKeyVault)" 
+    
+            if ($webhookName) {
+                # Convert the URI to a secure string
+                $webhookSecure = ConvertTo-SecureString $webhookprompt -AsPlainText -Force
+    
+                # Store the webhook URI in Azure Key Vault
+                Write-Host "Uploading Webhook '$webhookName' URI to Key Vault..."
+                Set-AzKeyVaultSecret -VaultName $keyVaultName -Name "Webhook-URI-$webhookName" -SecretValue $webhookSecure -Expires $ExpiryDate
+                Write-Host "Webhook '$webhookName' URI stored in Key Vault as 'Webhook-URI-$webhookName'."
+            } else {
+                Write-Warning "Webhook '$webhookName' does not have a valid URI. Skipping."
+            }
+        }
+    } else {
+        Write-Host "No webhooks found in the Automation Account '$AutomationAccountName'."
+    }
+# ------------------------------------------------------------------------------------------------------------------------------
